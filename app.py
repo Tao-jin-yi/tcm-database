@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Dict, List, Set
 
 import pandas as pd
+import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from st_link_analysis import st_link_analysis
 from st_link_analysis.component.styles import EdgeStyle, NodeStyle
 
@@ -22,6 +24,7 @@ HERE = Path(__file__).parent
 NETWORK_FILE = HERE / "data" / "network.json"
 TARGET_INFO_FILE = HERE / "data" / "target_info.json"
 STRUCTURES_FILE = HERE / "data" / "compound_structures.json"
+PDB_CACHE = HERE / "data" / "pdb_cache"   # AlphaFold PDB 本地缓存（不入 git）
 
 st.set_page_config(page_title="TCM Database · 草药-成分-靶点-疾病",
                    page_icon="🌿", layout="wide")
@@ -98,6 +101,93 @@ def load_db() -> dict:
 
 db = load_db()
 
+
+# ------------------------------------------------- 蛋白三维结构（AlphaFold）
+@st.cache_data(show_spinner="正在从 AlphaFold 获取蛋白结构…")
+def load_alphafold_pdb(accession: str) -> str:
+    """按 UniProt 登录号取 AlphaFold 预测的 PDB 文本（带本地缓存）。"""
+    PDB_CACHE.mkdir(exist_ok=True)
+    cache_file = PDB_CACHE / f"AF-{accession}-F1.pdb"
+    if cache_file.exists():
+        text = cache_file.read_text(encoding="utf-8", errors="ignore")
+        if "ATOM" in text:
+            return text
+    try:
+        resp = requests.get(
+            f"https://alphafold.ebi.ac.uk/files/AF-{accession}-F1-model_v6.pdb",
+            timeout=45)
+    except Exception:
+        return ""
+    if resp.status_code == 200 and "ATOM" in resp.text:
+        try:
+            cache_file.write_text(resp.text, encoding="utf-8")
+        except Exception:
+            pass  # 云端只读文件系统时仅失去磁盘缓存
+        return resp.text
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def resolve_accession(target_name: str, protein_hint: str = "") -> str:
+    """靶点名 → UniProt 登录号（target_info 未覆盖时按蛋白名全文检索）。
+
+    TCMSP 蛋白命名与 UniProt 官方名常有差异（如
+    “5-hydroxytryptamine 1A receptor” vs “5-hydroxytryptamine receptor 1A”），
+    用全文检索比精确字段匹配命中率高。
+    """
+    if protein_hint:
+        return protein_hint
+    try:
+        resp = requests.get(
+            "https://rest.uniprot.org/uniprotkb/search",
+            params={"query": f"{target_name} AND organism_id:9606 AND reviewed:true",
+                    "size": 1, "fields": "accession"},
+            timeout=20)
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            if results:
+                return results[0]["primaryAccession"]
+    except Exception:
+        pass
+    return ""
+
+
+def render_protein_3d(pdb_text: str, height: int = 430) -> None:
+    """用 3Dmol.js 渲染蛋白三维结构（PDB 内容内联，浏览器无需额外联网）。"""
+    html = f"""
+<div id="protein-viewer-{height}" style="height:{height}px; width:100%; background:#ffffff;"></div>
+<script src="https://3dmol.org/build/3Dmol-min.js"></script>
+<script>
+  const viewer = $3Dmol.createViewer(document.getElementById("protein-viewer-{height}"),
+                                     {{backgroundColor: "white"}});
+  viewer.addModel({json.dumps(pdb_text)}, "pdb");
+  viewer.setStyle({{}}, {{cartoon: {{color: "spectrum"}}}});
+  viewer.zoomTo();
+  viewer.render();
+</script>
+"""
+    components.html(html, height=height + 25)
+
+
+def target_3d_block(picked: str, height: int = 430) -> None:
+    """靶点三维结构展示块：解析登录号 → 取 PDB → 渲染。"""
+    info = db["target_info"].get(picked.upper(), {})
+    acc = info.get("accession") or resolve_accession(picked, info.get("accession", ""))
+    if not acc:
+        st.info("未能确定该靶点的 UniProt 登录号（多为非人源蛋白或自定义名称），"
+                "暂无可靠三维结构。")
+        return
+    with st.spinner(f"正在获取 {picked}（{acc}）的 AlphaFold 结构…"):
+        pdb_text = load_alphafold_pdb(acc)
+    if pdb_text:
+        st.markdown(f"**AlphaFold 预测模型**（UniProt：`{acc}`），可旋转缩放：")
+        render_protein_3d(pdb_text, height=height)
+        st.download_button("下载 PDB 结构文件", data=pdb_text,
+                           file_name=f"AF-{acc}-F1-model_v6.pdb",
+                           mime="chemical/x-pdb", key=f"dl_{acc}_{height}")
+    else:
+        st.info("AlphaFold DB 暂无该蛋白的预测结构。")
+
 # 侧边栏
 with st.sidebar:
     st.title("🌿 TCM Database")
@@ -111,8 +201,9 @@ with st.sidebar:
                "数据来源：TCMSP（成分 / 靶点 / SVM·RF 预测分）+ UniProt（基因符号与蛋白注释）"
                " + PubChem（化学结构）。结果为数据库预测，不构成临床建议。")
 
-tab_home, tab_herb, tab_comp, tab_tgt, tab_dis, tab_net = st.tabs(
-    ["📊 总览", "🌿 中药", "🧪 成分", "🎯 靶点", "🩺 疾病", "🕸️ 四层网络图"])
+tab_home, tab_herb, tab_comp, tab_tgt, tab_pred, tab_dis, tab_net = st.tabs(
+    ["📊 总览", "🌿 中药", "🧪 成分", "🎯 靶点", "🔬 靶点预测（含 3D 结构）",
+     "🩺 疾病", "🕸️ 四层网络图"])
 
 
 def _compound_row(mid: str) -> dict:
@@ -322,6 +413,8 @@ with tab_tgt:
         else:
             st.markdown(f"### {picked}")
             st.caption("UniProt 中暂无该符号的人源已审阅记录。")
+        with st.expander("蛋白三维结构（AlphaFold 预测模型，可旋转缩放）"):
+            target_3d_block(picked)
         cids = db["target_compounds"].get(picked, [])
         with st.expander(f"作用该靶点的成分（{len(cids)} 个）", expanded=True):
             rows = [_compound_row(c) for c in cids]
@@ -332,6 +425,80 @@ with tab_tgt:
         dis_of = db["target_diseases"].get(picked, [])
         with st.expander(f"关联疾病（{len(dis_of)} 种）", expanded=True):
             st.write("、".join(dis_of) if dis_of else "—")
+
+# ------------------------------------------------------------------ 靶点预测
+with tab_pred:
+    st.header("靶点预测（TCMSP SVM / RF 模型）")
+    st.caption("TCMSP 对每个成分-靶点对给出 **SVM**（支持向量机）与 **RF**（随机森林）"
+               "两个独立模型的预测概率分（0-1），并标注是否经**实验验证**（DrugBank）。"
+               "选择成分后按预测分排序展示作用靶点，并可直接查看靶点蛋白的三维结构。")
+
+    scores = db["edge_scores"]
+    comp_pool = sorted({c for (c, _t) in scores})
+    n_pairs = len(scores)
+    n_valid = sum(1 for v in scores.values() if v.get("validated"))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("预测成分-靶点对", f"{n_pairs:,}")
+    m2.metric("覆盖成分", len(comp_pool))
+    m3.metric("实验验证对", f"{n_valid:,}（{n_valid / n_pairs:.0%}）")
+
+    options = {f"{db['compounds'][c].get('name', c)}（{c}）": c
+               for c in comp_pool}
+    pick_label = st.selectbox("选择成分（按名称搜索）", sorted(options))
+    picked_comp = options[pick_label]
+
+    c1, c2, c3 = st.columns(3)
+    svm_min = c1.slider("SVM 预测分下限", 0.0, 1.0, 0.0, 0.05)
+    rf_min = c2.slider("RF 预测分下限", 0.0, 1.0, 0.0, 0.05)
+    only_validated = c3.checkbox("仅显示实验验证靶点")
+
+    tids = db["compound_targets"].get(picked_comp, [])
+    rows = []
+    for t in tids:
+        s = scores.get((picked_comp, t))
+        if s is None:
+            s = {"svm": None, "rf": None, "validated": False}
+        if s["svm"] is not None and (s["svm"] < svm_min or s["rf"] < rf_min):
+            continue
+        if only_validated and not s.get("validated"):
+            continue
+        info = db["target_info"].get(t.upper(), {})
+        rows.append({
+            "靶点": t,
+            "蛋白名": info.get("protein", ""),
+            "SVM 预测分": s["svm"] if s["svm"] is not None else "—",
+            "RF 预测分": s["rf"] if s["rf"] is not None else "—",
+            "综合分": (round((s["svm"] + s["rf"]) / 2, 3)
+                     if s["svm"] is not None else "—"),
+            "实验验证": "✔" if s.get("validated") else "",
+            "关联疾病数": len(db["target_diseases"].get(t, [])),
+        })
+    st.markdown(f"**{db['compounds'][picked_comp].get('name', picked_comp)}** 的预测靶点："
+                f"{len(tids)} 个（当前筛选后 {len(rows)} 个）")
+    if rows:
+        st.dataframe(pd.DataFrame(rows).sort_values(
+            "综合分", ascending=False, na_position="last"),
+            hide_index=True, width="stretch",
+            height=min(28 * (len(rows) + 1), 460))
+        chart_rows = [r for r in rows if r["综合分"] != "—"]
+        if chart_rows:
+            top = sorted(chart_rows, key=lambda r: -r["综合分"])[:15]
+            st.bar_chart(pd.DataFrame(
+                {"综合预测分": {r["靶点"]: r["综合分"] for r in top}}))
+            st.caption("综合预测分 = (SVM + RF) / 2，柱状图展示前 15 个靶点。")
+
+        st.divider()
+        st.subheader("预测靶点的蛋白三维结构")
+        pred_t = st.selectbox("选择靶点查看 3D 结构",
+                              [r["靶点"] for r in rows])
+        target_3d_block(pred_t, height=480)
+        if tids:
+            dis_of = sorted({d2 for t in tids
+                             for d2 in db["target_diseases"].get(t, [])})
+            with st.expander(f"该成分经靶点关联的疾病（{len(dis_of)} 种）"):
+                st.write(_disease_chips(dis_of) if dis_of else "—")
+    else:
+        st.info("当前筛选条件下没有靶点，请调低预测分下限或取消验证过滤。")
 
 # ------------------------------------------------------------------ 疾病
 with tab_dis:
