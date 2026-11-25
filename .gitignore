@@ -6,3 +6,5 @@ __pycache__/
 *.log
 data/pdb_cache/
 data/index.pkl
+tunnel.log
+tunnel_err.log
