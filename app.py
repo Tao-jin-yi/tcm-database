@@ -30,9 +30,11 @@ st.set_page_config(page_title="TCM Database · 草药-成分-靶点-疾病",
                    page_icon="🌿", layout="wide")
 
 # ------------------------------------------------------------------ 数据层
-@st.cache_resource(show_spinner="正在加载 TCMSP 全库数据…")
-def load_db() -> dict:
-    """加载四层网络并建立双向索引。"""
+INDEX_CACHE = HERE / "data" / "index.pkl"   # 预计算索引缓存（加速冷启动，不入 git）
+
+
+def _build_db() -> dict:
+    """解析 network.json 并建立双向索引。"""
     net = json.loads(NETWORK_FILE.read_text(encoding="utf-8"))
     node_by_id: Dict[str, dict] = {}
     herbs: Dict[str, dict] = {}          # 药名 -> node data
@@ -99,7 +101,65 @@ def load_db() -> dict:
     }
 
 
+@st.cache_resource(show_spinner="正在加载 TCMSP 全库数据…")
+def load_db() -> dict:
+    """加载四层数据库：优先读取预计算索引缓存（pickle），否则重建。
+
+    缓存按 network.json 修改时间自动失效；构建结果回写缓存后，
+    冷启动从"解析 11MB JSON + 建索引"降为一次快速反序列化。
+    """
+    import pickle
+
+    try:
+        if (INDEX_CACHE.exists()
+                and INDEX_CACHE.stat().st_mtime >= NETWORK_FILE.stat().st_mtime):
+            db_ = pickle.loads(INDEX_CACHE.read_bytes())
+            if db_.get("version") == 2:
+                return db_
+    except Exception:
+        pass  # 缓存损坏 / 版本不符时重建
+    db_ = _build_db()
+    db_["version"] = 2
+    try:
+        INDEX_CACHE.write_bytes(pickle.dumps(db_))
+    except Exception:
+        pass  # 云端只读文件系统时仅失去磁盘缓存
+    return db_
+
+
 db = load_db()
+
+
+# ------------------------------------------------------------------ 通用组件
+def csv_download(df: pd.DataFrame, label: str, key: str) -> None:
+    """渲染表格 CSV 下载按钮（utf-8-sig 保证 Excel 打开中文不乱码）。"""
+    st.download_button(
+        f"⬇ 下载{label}（CSV）",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"tcm_{key}.csv", mime="text/csv", key=f"csv_{key}")
+
+
+def sync_param(key: str, value: str) -> None:
+    """把选中状态写入 URL 查询参数（值未变化时不触发重跑）。"""
+    if st.query_params.get(key) != value:
+        st.query_params[key] = value
+
+
+def param_option(key: str, options: List[str]) -> int:
+    """从 URL 读取默认选中项索引；参数无效时回退 0。"""
+    v = st.query_params.get(key)
+    return options.index(v) if v in options else 0
+
+
+class SizedNodeStyle(NodeStyle):
+    """节点大小随 data(size) 缩放（度数越大节点越大）。"""
+
+    def dump(self) -> dict:
+        d = super().dump()
+        d["style"]["width"] = "data(size)"
+        d["style"]["height"] = "data(size)"
+        d["style"]["font-size"] = 11
+        return d
 
 
 # ------------------------------------------------- 蛋白三维结构（AlphaFold）
@@ -259,10 +319,12 @@ with tab_herb:
     st.header("中药浏览")
     c1, c2 = st.columns([3, 1])
     kw = c1.text_input("搜索中药（名称 / 拼音 / 拉丁名）",
-                       placeholder="例如：甘草 / gancao / Glycyrrhiza")
+                       placeholder="例如：甘草 / gancao / Glycyrrhiza",
+                       help="支持子串匹配，不区分大小写；结果可下载 CSV")
     cats = sorted({v.get("category", "") for v in db["herbs"].values()
                    if v.get("category")})
-    cat = c2.selectbox("按药类筛选", ["全部"] + cats)
+    cat = c2.selectbox("按药类筛选", ["全部"] + cats,
+                       help="TCMSP 按功效划分的药类（解表药、补虚药、清热药等）")
     view = {h: d for h, d in db["herbs"].items()
             if cat == "全部" or d.get("category") == cat}
     if kw.strip():
@@ -277,9 +339,15 @@ with tab_herb:
                  "药类": d.get("category", ""), "活性成分数": len(
                      db["herb_compounds"].get(h, []))}
                 for h, d in sorted(view.items())]
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+        herb_df = pd.DataFrame(rows)
+        st.dataframe(herb_df, hide_index=True, width="stretch",
                      height=min(28 * (len(rows) + 1), 460))
-        picked = st.selectbox("查看中药详情", sorted(view))
+        csv_download(herb_df, "中药列表", "herbs")
+        herb_names = sorted(view)
+        picked = st.selectbox("查看中药详情", herb_names,
+                              index=param_option("herb", herb_names),
+                              help="选中状态会写入网址，可直接分享给他人")
+        sync_param("herb", picked)
         mids = db["herb_compounds"].get(picked, [])
         tgt_set = {t for m in mids for t in db["compound_targets"].get(m, [])}
         dis_set = {d2 for t in tgt_set for d2 in db["target_diseases"].get(t, [])}
@@ -293,10 +361,11 @@ with tab_herb:
             f"**药类**：{d.get('category') or '—'}")
         with st.expander(f"活性成分（{len(mids)} 个，按靶点数排序）", expanded=True):
             if mids:
-                rows = [_compound_row(m) for m in mids]
-                st.dataframe(pd.DataFrame(rows).sort_values(
-                    "靶点数", ascending=False), hide_index=True, width="stretch",
-                    height=min(28 * (len(rows) + 1), 460))
+                comp_df = pd.DataFrame([_compound_row(m) for m in mids]).sort_values(
+                    "靶点数", ascending=False)
+                st.dataframe(comp_df, hide_index=True, width="stretch",
+                             height=min(28 * (len(comp_df) + 1), 460))
+                csv_download(comp_df, f"「{picked}」活性成分", f"herb_{picked}")
         with st.expander(f"关联疾病（{len(dis_set)} 种）"):
             st.write(_disease_chips(sorted(dis_set)) if dis_set else "—")
 
@@ -305,9 +374,13 @@ with tab_comp:
     st.header("活性成分检索")
     c1, c2, c3 = st.columns(3)
     kw = c1.text_input("搜索成分（名称 / 编号）",
-                       placeholder="例如：quercetin / MOL000098 / 黄芩苷")
-    ob_min = c2.slider("OB(%) 下限", 0.0, 100.0, 0.0, 5.0)
-    dl_min = c3.slider("DL 下限", 0.0, 1.0, 0.0, 0.05)
+                       placeholder="例如：quercetin / MOL000098 / 黄芩苷",
+                       help="支持中英文名与 TCMSP 编号子串匹配；结果可下载 CSV")
+    ob_min = c2.slider("OB(%) 下限", 0.0, 100.0, 0.0, 5.0,
+                       help="OB = 口服生物利用度（Oral Bioavailability，%），"
+                            "TCMSP 推荐阈值 ≥ 30%")
+    dl_min = c3.slider("DL 下限", 0.0, 1.0, 0.0, 0.05,
+                       help="DL = 类药性（Drug-likeness），TCMSP 推荐阈值 ≥ 0.18")
     view = {mid: d for mid, d in db["compounds"].items()
             if (d.get("ob", 0) or 0) >= ob_min and (d.get("dl", 0) or 0) >= dl_min}
     if kw.strip():
@@ -318,11 +391,19 @@ with tab_comp:
                 or needle in mid.lower()}
     st.caption(f"共 **{len(view)}** 个成分")
     if view:
-        rows = [_compound_row(mid) for mid in sorted(view)]
-        st.dataframe(pd.DataFrame(rows).sort_values(
-            ["靶点数", "OB(%)"], ascending=False), hide_index=True,
-            width="stretch", height=min(28 * (len(rows) + 1), 460))
-        picked = st.selectbox("查看成分详情", sorted(view))
+        comp_df = pd.DataFrame([_compound_row(mid) for mid in sorted(view)]).sort_values(
+            ["靶点数", "OB(%)"], ascending=False)
+        st.dataframe(comp_df, hide_index=True, width="stretch",
+                     height=min(28 * (len(comp_df) + 1), 460))
+        csv_download(comp_df, "成分列表", "compounds")
+        comp_labels = [f"{db['compounds'][mid].get('name', mid)}（{mid}）"
+                       for mid in sorted(view)]
+        pick_i = st.selectbox("查看成分详情", range(len(comp_labels)),
+                              format_func=lambda i: comp_labels[i],
+                              index=param_option("compound", sorted(view)),
+                              help="选中状态会写入网址，可直接分享给他人")
+        picked = sorted(view)[pick_i]
+        sync_param("compound", picked)
         d = view[picked]
         struct = db["structures"].get(picked, {})
         c1, c2 = st.columns([1, 2])
@@ -375,7 +456,8 @@ with tab_comp:
 with tab_tgt:
     st.header("靶点检索")
     kw = st.text_input("搜索靶点（基因符号 / 蛋白名）",
-                       placeholder="例如：TNF / AKT1 / interleukin-6")
+                       placeholder="例如：TNF / AKT1 / interleukin-6",
+                       help="靶点已经 UniProt 标准化为官方基因符号；结果可下载 CSV")
     view = db["targets"]
     if kw.strip():
         needle = kw.strip().lower()
@@ -385,14 +467,19 @@ with tab_tgt:
                                  .get("protein", "")).lower()}
     st.caption(f"共 **{len(view)}** 个靶点")
     if view:
-        rows = [{"靶点": t, "蛋白名": db["target_info"].get(t.upper(), {}).get("protein", ""),
-                 "关联成分数": len(db["target_compounds"].get(t, [])),
-                 "关联疾病数": len(db["target_diseases"].get(t, []))}
-                for t in sorted(view)]
-        st.dataframe(pd.DataFrame(rows).sort_values(
-            "关联成分数", ascending=False), hide_index=True, width="stretch",
-            height=min(28 * (len(rows) + 1), 460))
-        picked = st.selectbox("查看靶点详情", sorted(view))
+        tgt_df = pd.DataFrame(
+            [{"靶点": t, "蛋白名": db["target_info"].get(t.upper(), {}).get("protein", ""),
+              "关联成分数": len(db["target_compounds"].get(t, [])),
+              "关联疾病数": len(db["target_diseases"].get(t, []))}
+             for t in sorted(view)]).sort_values("关联成分数", ascending=False)
+        st.dataframe(tgt_df, hide_index=True, width="stretch",
+                     height=min(28 * (len(tgt_df) + 1), 460))
+        csv_download(tgt_df, "靶点列表", "targets")
+        tgt_names = sorted(view)
+        picked = st.selectbox("查看靶点详情", tgt_names,
+                              index=param_option("target", tgt_names),
+                              help="选中状态会写入网址，可直接分享给他人")
+        sync_param("target", picked)
         info = db["target_info"].get(picked.upper())
         if info:
             st.markdown(f"### {picked}　{info.get('protein', '')}")
@@ -444,13 +531,18 @@ with tab_pred:
 
     options = {f"{db['compounds'][c].get('name', c)}（{c}）": c
                for c in comp_pool}
-    pick_label = st.selectbox("选择成分（按名称搜索）", sorted(options))
+    pick_label = st.selectbox("选择成分（按名称搜索）", sorted(options),
+                              help="在框内直接输入即可搜索；选择后下方按预测分排序展示"
+                                   "该成分的预测作用靶点")
     picked_comp = options[pick_label]
 
     c1, c2, c3 = st.columns(3)
-    svm_min = c1.slider("SVM 预测分下限", 0.0, 1.0, 0.0, 0.05)
-    rf_min = c2.slider("RF 预测分下限", 0.0, 1.0, 0.0, 0.05)
-    only_validated = c3.checkbox("仅显示实验验证靶点")
+    svm_min = c1.slider("SVM 预测分下限", 0.0, 1.0, 0.0, 0.05,
+                        help="SVM = 支持向量机模型对“该成分作用于该靶点”的预测概率（0-1）")
+    rf_min = c2.slider("RF 预测分下限", 0.0, 1.0, 0.0, 0.05,
+                       help="RF = 随机森林模型的预测概率（0-1），与 SVM 相互独立")
+    only_validated = c3.checkbox("仅显示实验验证靶点",
+                                 help="勾选后只保留 DrugBank 收录的实验验证关系")
 
     tids = db["compound_targets"].get(picked_comp, [])
     rows = []
@@ -476,10 +568,11 @@ with tab_pred:
     st.markdown(f"**{db['compounds'][picked_comp].get('name', picked_comp)}** 的预测靶点："
                 f"{len(tids)} 个（当前筛选后 {len(rows)} 个）")
     if rows:
-        st.dataframe(pd.DataFrame(rows).sort_values(
-            "综合分", ascending=False, na_position="last"),
-            hide_index=True, width="stretch",
-            height=min(28 * (len(rows) + 1), 460))
+        pred_df = pd.DataFrame(rows).sort_values(
+            "综合分", ascending=False, na_position="last")
+        st.dataframe(pred_df, hide_index=True, width="stretch",
+                     height=min(28 * (len(pred_df) + 1), 460))
+        csv_download(pred_df, "预测靶点表", f"pred_{picked_comp}")
         chart_rows = [r for r in rows if r["综合分"] != "—"]
         if chart_rows:
             top = sorted(chart_rows, key=lambda r: -r["综合分"])[:15]
@@ -504,7 +597,8 @@ with tab_pred:
 with tab_dis:
     st.header("疾病检索（四层反查）")
     kw = st.text_input("搜索疾病（英文名，不区分大小写）",
-                       placeholder="例如：diabetes / cardiac / leukemia")
+                       placeholder="例如：diabetes / cardiac / leukemia",
+                       help="TCMSP 疾病为英文名（MeSH 词表），支持子串匹配")
     view = sorted(db["diseases"],
                   key=lambda d: -len(db["disease_targets"].get(d, [])))
     if kw.strip():
@@ -512,10 +606,16 @@ with tab_dis:
         view = [d for d in view if needle in d.lower()]
     st.caption(f"共 **{len(view)}** 种疾病（未输入关键词时按关联靶点数排序）")
     if view:
+        disease_names = view[:300]
         options = [f"{d}　关联靶点 {len(db['disease_targets'].get(d, []))} 个"
-                   for d in view[:300]]
-        pick = st.selectbox("选择疾病", options)
+                   for d in disease_names]
+        default_name = st.query_params.get("disease")
+        pick = st.selectbox("选择疾病", options,
+                            index=disease_names.index(default_name)
+                            if default_name in disease_names else 0,
+                            help="选中状态会写入网址，可直接分享给他人")
         picked = pick.split("　关联靶点")[0]
+        sync_param("disease", picked)
         tids = db["disease_targets"].get(picked, [])
         cids = {c for t in tids for c in db["target_compounds"].get(t, [])}
         herb_count: Dict[str, int] = {}
@@ -529,19 +629,23 @@ with tab_dis:
         m3.metric("来源中药", len(herb_count))
         with st.expander(f"关联靶点（{len(tids)} 个，按关联成分数排序）", expanded=True):
             if tids:
-                rows = [{"靶点": t,
-                         "蛋白名": db["target_info"].get(t.upper(), {}).get("protein", ""),
-                         "关联成分数": len(db["target_compounds"].get(t, [])),
-                         "关联疾病数": len(db["target_diseases"].get(t, []))}
-                        for t in tids]
-                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                             height=min(28 * (len(rows) + 1), 460))
+                dis_tgt_df = pd.DataFrame(
+                    [{"靶点": t,
+                      "蛋白名": db["target_info"].get(t.upper(), {}).get("protein", ""),
+                      "关联成分数": len(db["target_compounds"].get(t, [])),
+                      "关联疾病数": len(db["target_diseases"].get(t, []))}
+                     for t in tids])
+                st.dataframe(dis_tgt_df, hide_index=True, width="stretch",
+                             height=min(28 * (len(dis_tgt_df) + 1), 460))
+                csv_download(dis_tgt_df, f"「{picked}」关联靶点", f"dis_{picked}_targets")
         with st.expander(f"来源中药（{len(herb_count)} 味，按覆盖成分数排序）"):
             if herb_count:
-                rows = [{"中药": h, "覆盖成分数": n}
-                        for h, n in sorted(herb_count.items(), key=lambda kv: -kv[1])]
-                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                             height=min(28 * (len(rows) + 1), 460))
+                dis_herb_df = pd.DataFrame(
+                    [{"中药": h, "覆盖成分数": n}
+                     for h, n in sorted(herb_count.items(), key=lambda kv: -kv[1])])
+                st.dataframe(dis_herb_df, hide_index=True, width="stretch",
+                             height=min(28 * (len(dis_herb_df) + 1), 460))
+                csv_download(dis_herb_df, f"「{picked}」来源中药", f"dis_{picked}_herbs")
                 top = dict(sorted(herb_count.items(), key=lambda kv: -kv[1])[:15])
                 st.bar_chart(pd.DataFrame({"覆盖成分数": top}).T)
         with st.expander(f"相关成分（{len(cids)} 个）"):
@@ -623,18 +727,35 @@ with tab_net:
     if not nodes:
         st.warning("请先选择中药或疾病。")
     else:
+        # 节点大小 = 层级基数 + 度数加成（关联越多节点越大）
+        degree: Dict[str, int] = {}
+        for e in edges:
+            degree[e["data"]["source"]] = degree.get(e["data"]["source"], 0) + 1
+            degree[e["data"]["target"]] = degree.get(e["data"]["target"], 0) + 1
+        base_size = {"HERB": 54, "COMPOUND": 34, "TARGET": 34, "DISEASE": 44}
+        for n in nodes:
+            d = n["data"]
+            d["size"] = base_size.get(d["label"], 34) \
+                + min(degree.get(d["id"], 0), 25) * 1.6
+        if len(nodes) > 400:
+            st.warning(f"当前网络共 {len(nodes)} 个节点、{len(edges)} 条边，"
+                       "图形较复杂，渲染与拖动可能卡顿；"
+                       "建议减少选中中药数量或调低疾病节点上限。")
         node_styles = [
-            NodeStyle("HERB", "#E67E22", "name", "store"),
-            NodeStyle("COMPOUND", "#2A629A", "name", "science"),
-            NodeStyle("TARGET", "#27AE60", "name", "medical_services"),
-            NodeStyle("DISEASE", "#C0392B", "name", "sick"),
+            SizedNodeStyle("HERB", "#E67E22", "name", "store"),
+            SizedNodeStyle("COMPOUND", "#2A629A", "name", "science"),
+            SizedNodeStyle("TARGET", "#16A085", "name", "medical_services"),
+            SizedNodeStyle("DISEASE", "#C0392B", "name", "sick"),
         ]
         edge_styles = [
-            EdgeStyle("CONTAINS", caption="label", directed=True),
-            EdgeStyle("TARGETS", caption="label", directed=True),
-            EdgeStyle("INDICATES", caption="label", directed=True),
+            EdgeStyle("CONTAINS", directed=True),
+            EdgeStyle("TARGETS", directed=True),
+            EdgeStyle("INDICATES", directed=True),
         ]
         st_link_analysis({"nodes": nodes, "edges": edges},
                          layout="cose", node_styles=node_styles,
-                         edge_styles=edge_styles, height=640)
-        st.caption(f"当前网络：{len(nodes)} 个节点、{len(edges)} 条边。")
+                         edge_styles=edge_styles, height=640, key="tcm_net")
+        st.caption(f"当前网络：{len(nodes)} 个节点、{len(edges)} 条边。"
+                   "节点大小代表关联数量（度数）；颜色 + 图标区分层级："
+                   "橙＝中药、蓝＝成分、青＝靶点、红＝疾病；"
+                   "点击节点高亮邻居，双击展开邻居。")

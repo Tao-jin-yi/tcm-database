@@ -5,3 +5,4 @@ __pycache__/
 .idea/
 *.log
 data/pdb_cache/
+data/index.pkl
